@@ -1,0 +1,299 @@
+---
+title: "International Soccer: By Plane, Train, or Automobile?"
+author: "Tristan Zanowic"
+date: "December 13th, 2019"
+output: html_notebook
+---
+  
+GitHub Link: 
+
+#### Front Matter
+```{r}
+rm(list = ls()) # clear the workspace
+
+library(mosaic)
+library(tidyverse)
+library(lubridate)
+library(DataComputing)
+library(rpart)
+library(rpart.plot)
+library(party)
+```
+
+### Research Question
+
+**How does the distance traveled by national soccer teams influence their team performance?**
+
+## Introduction
+
+Soccer, the most popular sport in the world, is played by nearly every country on the globe. As a result, national teams end up traveling great distances in order to play friendly matches and international tournaments. The **goal** of this research is to analyze the travel done by national soccer teams and resulting performance in games played at non-neutral sights. It is important that the game is played at a non-neutral site because this means the away team has to travel to the home team's country. 
+
+The data "Results" features the scores and locations of 41,540 international soccer games from 1872 to early November 2019, at every type of competition. The data has 9 variables, 2 of which describe the goals scored by each team, and 7 other categorical variables that describe what teams are playing, where the game is played, and when.  
+
+
+```{r}
+Results <- read.csv("results 2.csv", header = TRUE)
+head(Results)
+tail(Results)
+nrow(Results)
+```
+
+<br>
+
+# Understanding the Factors
+
+#### Overall Talent
+
+Obviously, distance traveled will not be the biggest factor that plays into determining if a certain team will win or not. The most important factor of team performance is most often going to be players and overall talent. To account for this, international teams can be separated into tiers based on their all-time win percentage, which can be seen as a reflection of overall talent. Each country will first be filtered by the number of games played to prevent inflated winning percentages. Following this, tiers can be assigned to the remaining countries to determine the different levels of performance. These tiers will be referenced throughout the entirety of this report. 
+
+In the code below, teams are filtered by having played 50+ away games at non-neutral sites, a mark which 171 nations have passed. Next, the data is mutated to assign each game a win variable which is 1 if the away team won, 0 if not. Through some simple data wrangling, we can find the sum of away wins and total away games, which can be used to find all-time away win percentage. Finally, tiers are assigned based on this win percentage, in which teams with win percentages above .36 are tier one, teams above .22 are tier two, and the rest are tier three. Soccer powerhouses like Germany and Argentina are tier one, while much smaller countries like Yemen are in tier three. 
+
+```{r}
+  # Filtering the total games for all away teams (at non-neutral sights)
+FilteredResults <- 
+  Results %>%
+    filter(neutral == "FALSE") %>%
+      group_by(away_team) %>%
+        mutate(totalawaygames = n()) %>%
+          filter(totalawaygames > 50)
+
+  # Determining if the away team won or lost
+FilteredResults <-
+  FilteredResults %>%
+    mutate(win = ifelse(away_score > home_score, 1, 0))
+
+  # Assigning every team a tier based on away win percentage
+WinPctTiers <-
+FilteredResults %>%
+  group_by(away_team, win, totalawaygames) %>%
+  summarise(totalwin = sum(win)) %>%
+  mutate(awaywinpct = totalwin / totalawaygames) %>%
+   filter(win == 1) %>%
+   mutate(awaytier = ifelse(awaywinpct > .36,"Tier 1",
+                      ifelse(awaywinpct < .22, "Tier 3", "Tier 2")))
+
+WinPctTiers
+```
+
+<br>
+
+This data can then be joined with the original filtered results to create the *TieredResults* data table, which features all the filtered matches as well as the tier of all the away teams.
+```{r}
+  # Joining the filtered results with the tiers
+TieredResults <-
+FilteredResults %>%
+  left_join(WinPctTiers, by = c("away_team")) %>%
+  select(date, home_team, away_team, home_score, away_score, 
+         tournament, country, win.x, awaytier) %>%
+  rename(awaywin = win.x)
+
+TieredResults
+```
+
+<br>
+
+#### Game Type
+
+The game type could also be an important factor to consider when looking at team performance. Two types of games are important to distinguish; friendlies and competitive matches. Competitive matches offer national teams chances to win trophies or qualify for major tournaments, while friendlies are often used as exhibition games. This could easily effect team performance, as many national teams do not feel the need to field their best starting squad when the stakes are not high, like in friendly matches. 
+
+To differentiate between the two game types, the variable *gametype* is created with two levels: friendly and competitive.
+
+```{r}
+# Adding the variable Gametype using Regex Expression
+TieredResults <-
+TieredResults %>%
+  mutate(gametype = ifelse(grepl("Friendly", tournament), "Friendly", "Competitive"))
+```
+
+<br>
+
+## Finding Distances
+
+#### Adding Latitude and Longitudes
+
+Now that there is a data table with every gametype as well as country tiers, another data table can be introduced. The country centroids csv, named *CountryLatLong* in the code below, lists the latitude and longitude of 260 countries. Country centroids offer the most central point of every country, which is the best location to use to find an average distance between two countries. This data can be joined with the tiered results data to find a latitude & longitude for the home and away team's country. The resulting data table, *LatLongResults*, has all the filtered results and a latitude and longitude for each country playing.
+
+```{r}
+CountryLatLong <- read.csv("country_centroids.csv", header = TRUE)
+head(CountryLatLong)
+nrow(CountryLatLong)
+```
+```{r}
+# Joining the country latitude and longitude with the host country
+HomeLatLong <-
+TieredResults %>%
+  left_join(CountryLatLong %>% select(name, latitude, longitude),
+            by = c("country" = "name")) %>%
+              rename(homelat = latitude,
+                     homelong = longitude)
+
+  # Joining the country latitude and longitude with the away country
+LatLongResults <-
+  HomeLatLong %>%
+    left_join(CountryLatLong %>% select(name, latitude, longitude),
+            by = c("away_team" = "name")) %>%
+              rename(awaylat = latitude,
+                     awaylong = longitude)
+
+head(LatLongResults)
+```
+
+<br>
+
+#### Determining Distances
+
+In order to find distance measurements, we can use the haversine function (https://www.movable-type.co.uk/scripts/latlong.html) which takes two geographic points and finds the distance between them. Using the previously created *LatLongResults* data table, distances are found from the away country to the host country (where the game is being played) in the code below.
+
+```{r}
+# User-Defined Haversine Function
+haversine <- function(lat1, lon1, lat2, lon2, Radius = 3958){  # in miles
+  lat1 <- pi*lat1/180; lat2 <- pi*lat2/180; 
+  lon1 <- pi*lon1/180; lon2 <- pi*lon2/180;
+  dlon <- lon2 - lon1 
+  dlat <- lat2 - lat1 
+  a <- (sin(dlat/2))^2 + cos(lat1) * cos(lat2) * (sin(dlon/2))^2 
+  c <- 2 * atan2( sqrt(a), sqrt(1-a) ) 
+  Radius * c 
+}
+```
+
+```{r}
+  # Determining distance using haversine function
+DistanceResults <-
+LatLongResults %>%
+  mutate(distance = haversine(homelat, homelong, awaylat, awaylong)) %>%
+  select(date, home_team, away_team, home_score, away_score,
+         awaywin, awaytier, gametype, country, distance) 
+
+DistanceResults 
+```
+
+<br>
+
+#### Visualizing Distance
+
+Once distances have been found, a density plot can be created to show the distribution of distances traveled by away teams. Based on the plot below, it appears that all three away tiers travel a similar distribution of distances to their games. An outstanding majority of away games are played within 2500 miles, with the peak around 500 miles. However, there are still plenty of games played in which away teams travel more than 2500 miles, including some up to 12000 miles away.
+
+```{r}
+# Overlaid Density Plot using ggplot
+DistanceResults %>%
+  na.omit() %>%
+  ggplot(aes(x = distance, group = awaytier)) +
+  geom_density(aes(color = awaytier, fill = awaytier), alpha = .2)
+```
+
+<br>
+
+To make the distance variable easier to interpret, the distance tier is created in the code below. This variable has 4 levels, in which the distances less than 600 miles are labeled "Close", distances from 600 to 1200 miles are "Distant", distances from 1200 to 2800 miles are "Far", and finally distances above 2800 miles are "Very Far". These parameters were chosen to best capture an approximately even number of teams in each level. 
+
+From the table produced below, there appears to be 7700 to 8000 games that are part of the first three tiers, while only about 5200 games are labeled "Very Far". It is expected that less games would be considered "Very Far" based on the density plot above.
+
+```{r}
+# Creating the distance-tier variable
+CompleteResults <-
+DistanceResults %>%
+  mutate(distancetier = ifelse(distance < 600, "Close",
+                        ifelse(distance < 1200, "Distant",
+                        ifelse(distance < 2800, "Far", "Very Far"))))
+# Table of distance tiers
+CompleteResults %>%
+  group_by(distancetier) %>%
+  summarise(games = n(), 
+            avgdist = mean(distance)) %>%
+  na.omit()
+```
+
+<br>
+
+We can visualize these distance tiers by adding vertical lines to the original density plot to separate the different distance tiers. Lines are added at distances of 600, 1200, and 2800 miles, the same cutoffs as the distance tiers.
+
+```{r}
+# Overlaid Density Plot with vertical lines seperating distance tiers
+DistanceResults %>%
+  na.omit() %>%
+  ggplot(aes(x = distance, group = awaytier)) +
+  geom_density(aes(color = awaytier, fill = awaytier), alpha = .2) +
+  geom_vline(xintercept = 600) +
+  geom_vline(xintercept = 1200) +
+  geom_vline(xintercept = 2800)
+```
+
+<br>
+
+## Winning Percentage from Tier and Distance
+
+The first informative graph below shows winning percent at each combination of away tiers and distance tiers. Based on the graph, it appears that as distance increases, the resulting win percentage does not change much, if at all. We can see that for tier two and tier three away teams, their win percentage does not change significantly when they travel different distances. However, for tier one teams, they have a much higher win percentage in "Far" games (1200-2800 miles), which really stands out on the graph. This is a very surprising mark with no clear explanation behind it.
+
+```{r}
+CompleteResults %>%
+  na.omit() %>%
+  group_by(distancetier, awaytier) %>%
+  mutate(totalgames = n()) %>%
+  mutate(totalwins = sum(awaywin)) %>%
+  mutate(winpct = totalwins / totalgames) %>%
+  group_by(awaytier, distancetier) %>%
+  summarise(n = n(), 
+            avgwinpct = mean(winpct)) %>%
+  ggplot(aes(x = awaytier, y = avgwinpct)) +
+  geom_bar(aes(fill = distancetier), stat = "identity", position = "dodge") 
+```
+
+<br>
+
+## Difference between Competition Types
+
+The next graph below shows average win percentage based on game type, faceted by distance. The same trends from the previous graph appear, but new patterns do emerge from the game type. First, there is clearly a higher win percentage for tier one and tier two teams playing competitive games over friendlies. This agrees with the previous assumption that better teams might rest their starting squads and not risk injury, generally hurting their overall performance. However, the alternative is true for tier three teams, which perform better in friendly games. Finally, by looking closely at tier one win percentage at each distance, there appears to be a pattern between each game type. As the distance increases, the difference in win percentage between competitive and friendly matches decreases. Tier one teams playing in competitive games might be slightly effected by the distance traveled based on this graph.
+
+```{r fig.height=4, fig.width=8}
+CompleteResults %>%
+  na.omit() %>%
+  group_by(gametype, awaytier, distancetier) %>%
+   mutate(totalgames = n()) %>%
+  mutate(totalwins = sum(awaywin)) %>%
+  mutate(winpct = totalwins / totalgames) %>%
+  summarise(n = n(), 
+            avgwinpct = mean(winpct)) %>%
+  ggplot(aes(x = awaytier, y = avgwinpct)) +
+  geom_bar(aes(fill = gametype), stat = "identity", position = "dodge") +
+  facet_wrap(~ distancetier)
+```
+
+<br>
+
+## Regression Tree
+
+The final graph of this report is a regression tree plotting the probability an away team wins based on different predictor variables. One final variable, *hometier*, is added to the data because the quality of the home team is likely a big factor in determining if the away team wins or not. This is done in the same manner as *awaytier*, where we joined the tiers data with the team of interest.
+
+It should be noted that fitting a regression tree using *awaytier, hometier, distance, and gametype* to predict if the away team wins shows that only *awaytier* and *hometier* are useful predictors. This means distance and game type do not effect the probability of an away team winning enough to be a part of the tree below.
+
+In the regression tree, many probabilities are calculated based on different combinations of away and home tier. First, if the away team is tier three, there is only a 15% chance they win the game, regardless of the home tier. Moving down the tree,  we can see that tier two and tier one away teams playing a tier one/tier two home team are given a 23% and 37% chance of winning, respectively. Finally, tier two away teams playing a tier three home team have a 41% chance of winning, while tier one away teams playing the same opponent have a much higher probability of winning, 67%. 
+
+```{r}
+# Selecting only needed variables for the join
+WinPctTiers <-
+  WinPctTiers %>%
+  select(away_team, awaytier)
+
+# Joining the tiers data with the results, by home team
+CompleteResults2 <-
+CompleteResults %>%
+  left_join(WinPctTiers, by = c("home_team" = "away_team")) %>%
+  rename(hometier = awaytier.y) %>%
+  rename(awaytier = awaytier.x)
+
+# Plotting a Regression Tree
+WinModel <- rpart(awaywin ~ distance + awaytier + hometier + gametype, data = CompleteResults2)
+rpart.plot(WinModel)
+```
+
+<br>
+
+## Conclusions
+
+The overarching goal of this research was to analyze how distance traveled has influenced team performance at the international soccer level. Throughout the data analysis and data visualizations, some small trends could be seen such as distance effecting teams more in competitive games than in friendlies. However, it does appear that distance traveled does not play that big of a role in determining if the away team will win or not. The most important factor, which can be seen in the regression tree, is the talent of the two teams playing. This does not mean that travel distance never plays a role in a match, but I would not bet the house on New Zealand just because the United States has a 21 hour plane trip ahead of them.
+
+
+
+
+
+
